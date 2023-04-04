@@ -1,0 +1,716 @@
+---
+title: '[ENSAE, 2A] Linear Time Series 2023'
+author: "Tristan Amadei/ Antoine Klein"
+date: "2023-03-17"
+output:
+  html_document:
+    toc: yes
+    toc_depth: 4
+    number_sections: yes
+    theme: readable
+    highlight: tango
+    toc_float:
+      collapsed: no
+      smooth_scroll: no
+    css: style.css
+    fig_width: 8
+    fig_height: 3
+  pdf_document:
+    toc: yes
+    toc_depth: '4'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+<p id="p_">
+
+<b> Subject : Modeling the electricity production of a dam </b>
+
+</p>
+
+Objective: Predict electricity production for the next day based on past production
+
+# We install the packages
+
+```{r}
+install.packages("manipulateWidget")
+install.packages("tseries")
+install.packages("zoo")
+install.packages("dygraphs")
+install.packages('pls')
+install.packages("forecast", dependencies = TRUE)#To make predictions
+install.packages("ggplot2") #To make plots
+install.packages("fUnitRoots")#Tests unit root
+```
+
+# We import the packages
+
+```{r}
+library(data.table)
+library(magrittr)
+library(dygraphs)
+library(manipulateWidget)
+library(pls)
+require(zoo) #convenient and easy format to use time series
+require(tseries) #various functions on time series
+library(forecast)
+library(ggplot2)
+library(fUnitRoots)
+
+```
+
+# Data
+
+We focus on a single hydroelectric dam.
+
+-   `date` : date of observation of the measure.
+-   `y` : electricity production of the dam.
+-   `x` : height of the river on which the dam is located, measured by a station placed upstream of the dam.
+
+```{r fig.width=8, fig.height=5, fig.align='center'}
+#We change the path
+path <- "~/work/Linear_Time_Series/"
+setwd(path) #defines the workspace
+getwd() #displays the wd
+# Import of data
+dt <- readRDS("./data.RDS")
+
+# Visualisation
+gy <- dygraph(data = dt[, .(date, y)],main = "Electricity production",
+              xlab = "date", ylab = "y", group = "rowData") %>% 
+  dyOptions(colors = "blue")
+gx <- dygraph(data = dt[, .(date, x)],main = "Height of the watercourse",
+              xlab = "date", ylab = "x", group = "rowData")%>% 
+  dyOptions(colors = "green")
+
+manipulateWidget::combineWidgets(list = list(gy, gx), nrow = 2)
+```
+
+**Remark :**
+
+-   The production falls towards '0'. We don't know exactly why.
+    -   Dam in non-active ?
+    -   Can we model them ?
+-   Stream height spikes are observed during the winter.
+
+# Modeling
+
+*Objective :* improve the initial method.
+
+*Questions :*
+
+-   how to do a train/test split when the data are temporal?
+-   how to do a cross-validation on time series?
+
+*Selection of the train/test cut :*
+
+```{r}
+dt[, range(date)]
+```
+
+-   train on 2021 - 2022 ;
+-   test on 2023.
+
+*Forecast horizon:* we focus on the horizon : **J+1**.
+
+*Forecast error measurement:*
+
+```{r}
+get_rmse <- function(y_true, y_prev){
+  sqrt(mean( (y_true - y_prev) ** 2 ))
+}
+```
+
+## Method to be improved
+
+The method initially implemented is to average the last 4 days.
+
+```{r}
+# Create lag variables
+lag_names <- paste0("y_lag_", 1:4)
+dt_prev <- copy(dt)
+
+dt_prev[, c(lag_names) := shift(x = y, n = 1:4, type = "lag")]
+dt_prev <- na.omit(dt_prev)
+
+# We calculate the forecasts
+dt_prev[, prev := rowMeans(.SD), .SDcols = lag_names]
+
+# Forecasts
+dt_init_prev <- dt_prev[year(date) <= 2022, prev := NA]
+```
+
+```{r}
+dt_init_prev
+```
+
+```{r}
+rmse_init <- get_rmse(y_true = dt_init_prev[ !is.na(prev), y],
+                      y_prev = dt_init_prev[ !is.na(prev), prev])
+rmse_init
+```
+
+```{r fig.width=8, fig.height=3, fig.align='center'}
+dygraphs::dygraph(data = dt_init_prev[, .(date, y, prev)], main = "prev vs true") %>% 
+  dygraphs::dySeries(name = "prev", color = "red")
+```
+
+-   Analyze the graph above.
+
+## Improvements
+
+### Adding covariates
+
+Covariates can be :
+
+-   delays of `y` ;
+-   delays of `x` ;
+-   aggregates of `y` and/or `x` delays.
+
+```{r}
+## Add lag of x and y
+dt_model <- copy(dt)
+dt_model[, c(paste0("y_lag_", 1:14)) := shift(x = y, n = 1:14, type = "lag")]
+dt_model[, c(paste0("x_lag_", 1:14)) := shift(x = x, n = 1:14, type = "lag")]
+dt_model <- na.omit(dt_model)
+```
+
+```{r}
+dt_train <- dt_model[year(date) <= 2022]
+dt_test <- dt_model[year(date) > 2022]
+```
+
+### PLS
+
+Partial least squares (PLS) regression. The number of components to be retained is determined by cross-validation on the training data. Reference: [cliquer ici](https://www.math.univ-toulouse.fr/~besse/Wikistat/pdf/st-m-app-sparse-pls.pdf) ;
+
+-   PLS than on the delays of the production `y` ;
+
+```{r}
+ylag <- paste0("y_lag_", 1:14)
+
+## Model estimation
+pls_prod <- pls::plsr(formula = y ~ .,
+                      data = dt_train[, .SD, .SDcols = c("y", ylag)],
+                      validation = "CV")
+## Take optimal ncomp
+rmsepcv.pls <- pls::MSEP(pls_prod, estimate = 'CV')
+ncp.optim <- which.min(rmsepcv.pls$val["CV", , ]) - 1
+ncp.optim <- ifelse(ncp.optim == 0, 1, ncp.optim)
+
+# Forecasts
+prev_pls <- predict(object = pls_prod, newdata = dt_test, ncomp = ncp.optim)
+
+## Forecasts are bound if they are less than 0
+prev_pls <- ifelse(prev_pls[, 1, 1] < 0, 0, prev_pls[, 1, 1])
+prev_pls <- unname(prev_pls)
+```
+
+```{r}
+rmse_pls <- get_rmse(y_true = dt_test[, y], y_prev = prev_pls)
+rmse_pls
+```
+
+```{r fig.width=8, fig.height=3, fig.align='center'}
+dt_prev_pls <- rbind(
+  copy(dt_test)[, .(date, y)][, prev_pls := prev_pls],
+  copy(dt_train)[, .(date, y)][, prev_pls := NA]
+)
+
+dygraphs::dygraph(data = dt_prev_pls, main = "PLS - prev vs true") %>% 
+  dygraphs::dySeries(name = "prev_pls", color = "red")
+```
+
+*TO DO :*
+
+-   Compare this rmse to the initial forecast ;
+-   Add the covariates in `x_` to the model. Is there an improvement? Why or why not?
+-   Create more lag aggregates and add them to the model. Is there an improvement?
+
+### LS
+
+-   Implement a linear regression. Compare it to your best PLS model?
+-   Reference : [cliquez ici.](https://bookdown.org/evraloui/lbira2110/modeles-lineaires.html)
+
+### ARIMA
+
+#### Preprocessing and Data Visualisation
+
+```{r}
+# Import of data
+dt <- readRDS("./data.RDS")
+dt <- dt[seq(dim(dt)[1],1),]
+#We smooth the model: if y=0 we take the previous value
+for (i in (1:dim(dt)[1])) {
+  if (dt[i,2] == 0) {
+    dt[i,2] <- (dt [i-1,2] + dt[i+1,2])/2
+  }
+}
+#We divide our dataset into TRAIN/TEST
+dt_train <- dt[year(date) <= 2022]
+dt_test <- dt[year(date) > 2022]
+dt_train
+```
+
+```{r}
+#Descriptive statistics of our train sample
+summary(dt_train)
+```
+
+```{r}
+#The 7 good predictions
+xm.source_test_7 <- zoo(dt_test[[2]])[1:7]
+xm.source_test_7
+summary(xm.source_test_7)
+plot(xm.source_test_7)
+```
+
+```{r}
+#The 7 good predictions with lag
+LAG=30
+xm.source_test_7_lag <- zoo(dt[[2]])
+desaison_test_7_lag <- xm.source_test_7_lag-lag(xm.source_test_7_lag,-LAG)
+desaison_test_7_lag <- desaison_test_7_lag[523:530]
+desaison_test_7_lag
+summary(desaison_test_7_lag)
+plot(desaison_test_7_lag)
+```
+
+```{r}
+xm.source <- zoo(dt_train[[2]])
+xm.source_vrai <- zoo(dt[[2]])
+xm <- xm.source
+plot(xm)
+
+```
+
+```{r}
+adf <- adfTest(xm, lag=0, type="nc") #
+adf
+#Wish: <0.05 H0 : rho =1
+#There is a unit root
+```
+
+
+#### A first approach with an auto_arima on the raw series
+
+```{r}
+#A first approach with a function that displays the ARIMA model in a "black-box" way
+fit <- auto.arima(xm)
+
+dt_arima <- copy(dt)
+for (i in (1:dim(dt_arima)[1])) {
+  dt_arima[i,2] <- NaN
+  
+}
+for (i in (1:length(as.numeric(forecast(fit,h=20)$mean)))) {
+  dt_arima[518 +i,2] <- as.numeric(forecast(fit,h=20)$mean)[[i]]
+  
+}
+names(dt_arima)[names(dt_arima) == 'y'] <- 'y_arima'
+```
+
+```{r}
+Graph <- cbind(dt[dt$date >= "2022-12-15" & dt$date <= "2023-02-01", ][,-3], dt_arima[dt_arima$date >= "2022-12-15" & dt_arima$date <= "2023-02-01", ][,-3])
+dygraph(Graph, main = "Forecast VS Black-Box model labels")%>%
+  dySeries("y", label = "Label") %>%
+  dySeries("y_arima", label = "Prev") 
+```
+
+```{r}
+plot(forecast(fit,h=20),xlim = c(450, 550))
+```
+
+```{r}
+#The model thus found: it is more than criticizable!
+fit
+```
+
+```{r}
+rmse_init <- get_rmse(y_true = xm.source_test_7,
+                      y_prev = as.numeric(forecast(fit,h=7)$mean))
+rmse_init
+```
+
+```{r}
+#Autocorrelation of our series:
+par(mfrow=c(1,2)) #
+acf(xm, lag.max = 600) #
+axis(side=1,at=seq(0,600,50)) #
+acf(xm, lag.max = 55) #
+axis(side=1,at=seq(0,55,5)) #
+#We take q = 50
+```
+
+```{r}
+#Partial autocorrelation of our series
+par(mfrow=c(1,2)) #
+pacf(xm, lag.max = 600) #
+axis(side=1,at=seq(0,600,50))
+pacf(xm, lag.max = 20) #
+axis(side=1,at=seq(0,20,5))
+#We take p=4
+```
+
+#### A second approach with an auto_arima on the 30 days lagged series
+
+
+```{r}
+#We try to subtract the monthly effect
+LAG=30
+desaison <- xm-lag(xm,-LAG) #
+desaison <- desaison - mean(desaison)
+summary(desaison)
+plot(desaison)
+```
+
+```{r}
+adf <- adfTest(desaison, lag=0, type="nc") #
+adf
+#Wish: <0.05 H0 : rho =1
+#There is no longer a unit root
+```
+
+```{r}
+#Autocorrelation of our series with lag:
+par(mfrow=c(1,2)) #
+acf(desaison, lag.max = 600) #
+axis(side=1,at=seq(0,600,50)) #
+acf(desaison, lag.max = 23) #
+axis(side=1,at=seq(0,23,5)) #
+#We take q=20
+```
+
+```{r}
+#Partial autocorrelation of our series
+par(mfrow=c(1,2)) #
+pacf(desaison, lag.max = 600) #
+axis(side=1,at=seq(0,600,50))
+pacf(desaison, lag.max = 10) #
+axis(side=1,at=seq(0,10,1))
+#We take p=5
+```
+
+```{r}
+#Black-Box" model on this series without monthly effect :
+#A first approach with a function that displays the ARIMA model in a "black-box" way
+fit <- auto.arima(desaison)
+xm.source_vrai <- zoo(dt[[2]])
+desaison_vrai <- xm.source_vrai-lag(xm.source_vrai,-LAG) 
+
+dt_arima <- copy(dt)
+for (i in (1:dim(dt_arima)[1])) {
+  dt_arima[i,2] <- NaN
+  
+}
+for (i in (1:length(as.numeric(forecast(fit,h=20)$mean)))) {
+  dt_arima[518 +i,2] <- as.numeric(forecast(fit,h=20)$mean)[[i]]
+  
+}
+names(dt_arima)[names(dt_arima) == 'y'] <- 'y_arima'
+
+dt_lag <-copy(dt)
+for (i in (1:dim(dt_lag)[1])) {
+  dt_lag[i,2] <- desaison_vrai[i]
+  
+}
+```
+
+```{r}
+Graph <- cbind(dt_lag[dt_lag$date >= "2022-12-15" & dt_lag$date <= "2023-02-01", ][,-3], dt_arima[dt_arima$date >= "2022-12-15" & dt_arima$date <= "2023-02-01", ][,-3])
+dygraph(Graph, main = paste("Forecast VS Labels Black-Box model with LAG= ",toString(LAG)))%>%
+  dySeries("y", label = "Label") %>%
+  dySeries("y_arima", label = "Prev") 
+```
+
+```{r}
+fit
+```
+
+```{r}
+rmse_init <- get_rmse(y_true = desaison_test_7_lag,
+                      y_prev = as.numeric(forecast(fit,h=7)$mean))
+rmse_init
+```
+
+#### Stationarity test of the raw/aggregate series
+
+
+```{r}
+#### Q4 ####
+#Null hypothesis: the series has a root on the unit circle / H1: Stationarity
+pp.test(xm) #
+#We want a p-value lower than 0.05 : this is not the case with the initial series
+```
+
+```{r}
+#Null hypothesis: the series has a root on the unit circle / H1: Stationarity
+pp.test(desaison)
+#We want a p-value lower than 0.05 : this is the case with the lagged series
+```
+
+#### ARIMA model testing by hand 
+
+```{r}
+#We test an arima model:
+arima5_0_20 <- arima(desaison,c(5,0,20)) #
+arima5_0_20
+```
+
+#### Hypothesis testing to select the suitable models
+
+```{r}
+Box.test(arima5_0_20$residuals, lag=26, type="Ljung-Box", fitdf=5) #
+#Wa want p-valeur >0.05
+```
+
+```{r}
+Qtests <- function(series, k, fitdf=0) {
+  pvals <- apply(matrix(1:k), 1, FUN=function(l) {
+    pval <- if (l<=fitdf) NA else Box.test(series, lag=l, type="Ljung-Box", fitdf=fitdf)$p.value
+    return(c("lag"=l,"pval"=pval))
+  })
+  return(t(pvals))
+}
+round(Qtests(arima5_0_20$residuals,29,fitdf=5),3)
+#We want it to be greater than 0.05
+```
+
+```{r}
+signif <- function(estim){ #test function of the individual meanings of the coefficients
+  coef <- estim$coef
+  se <- sqrt(diag(estim$var.coef))
+  t <- coef/se
+  pval <- (1-pnorm(abs(t)))*2
+  return(rbind(coef,se,pval))
+}
+
+signif(arima5_0_20) #
+```
+
+```{r}
+arimafit <- function(estim){
+  adjust <- round(signif(estim),3)
+  pvals <- Qtests(estim$residuals,30,fitdf=5)
+  pvals <- matrix(apply(matrix(1:30,nrow=6),2,function(c) round(pvals[c,],3)),nrow=6)
+  colnames(pvals) <- rep(c("lag", "pval"),5)
+  cat("Nullity tests of coefficients :\n")
+  print(adjust)
+  cat("\n Tests for absence of autocorrelation of residues : \n")
+  print(pvals)
+}
+estim <- arima(desaison,c(5,0,20)); arimafit(estim)
+```
+
+```{r}
+## Function for estimating an arima and checking its fit and validity
+modelchoice <- function(p,q,data=desaison, k=24){
+  estim <- try(arima(data, c(p,0,q),optim.control=list(maxit=20000)))
+  if (class(estim)=="try-error") return(c("p"=p,"q"=q,"arsignif"=NA,"masignif"=NA,"resnocorr"=NA, "ok"=NA))
+  arsignif <- if (p==0) NA else signif(estim)[3,p]<=0.05
+  masignif <- if (q==0) NA else signif(estim)[3,p+q]<=0.05
+  resnocorr <- sum(Qtests(estim$residuals,24,length(estim$coef)-1)[,2]<=0.05,na.rm=T)==0
+  checks <- c(arsignif,masignif,resnocorr)
+  ok <- as.numeric(sum(checks,na.rm=T)==(3-sum(is.na(checks))))
+  return(c("p"=p,"q"=q,"arsignif"=arsignif,"masignif"=masignif,"resnocorr"=resnocorr,"ok"=ok))
+}
+
+## Function to estimate and verify all arima(p,q) with p<=pmax and q<=max
+armamodelchoice <- function(pmax,qmax){
+  pqs <- expand.grid(0:pmax,0:qmax)
+  t(apply(matrix(1:dim(pqs)[1]),1,function(row) {
+    p <- pqs[row,1]; q <- pqs[row,2]
+    cat(paste0("Computing ARMA(",p,",",q,") \n"))
+    modelchoice(p,q)
+  }))
+}
+
+pmax<-5
+qmax<-20
+armamodels <- armamodelchoice(pmax,qmax) 
+
+
+selec <- armamodels[armamodels[,"ok"]==1&!is.na(armamodels[,"ok"]),] 
+selec
+#We have three valid models:
+#ARMA(3,9)
+#ARMA(5,19)
+#ARMA(5,20)
+```
+
+```{r}
+pqs <- apply(selec,1,function(row) list("p"=as.numeric(row[1]),"q"=as.numeric(row[2]))) #creates a list of p and q orders of candidate models
+names(pqs) <- paste0("arma(",selec[,1],",",selec[,2],")") #rename the elements of the list
+models <- lapply(pqs, function(pq) arima(desaison,c(pq[["p"]],0,pq[["q"]]))) #creates a list of estimated candidate models
+vapply(models, FUN.VALUE=numeric(2), function(m) c("AIC"=AIC(m),"BIC"=BIC(m))) #computes the AIC and BIC of the candidate models
+### ARMA(5,19) minimizes the information criteria.
+```
+
+```{r}
+#ARMA(3,9) for the next week
+rmse_init <- get_rmse(y_true = desaison_test_7_lag,
+                      y_prev = as.numeric(forecast(arima(desaison, c(3,0,9)),h=7)$mean))
+rmse_init
+```
+
+```{r}
+#ARMA(5,19) for the next week
+rmse_init <- get_rmse(y_true = desaison_test_7_lag,
+                      y_prev = as.numeric(forecast(arima(desaison, c(5,0,19)),h=7)$mean))
+rmse_init
+```
+
+```{r}
+#ARMA(5,20) for the next week
+rmse_init <- get_rmse(y_true = desaison_test_7_lag,
+                      y_prev = as.numeric(forecast(arima(desaison, c(5,0,20)),h=7)$mean))
+rmse_init
+```
+
+```{r}
+#Model "By hand" on this series without monthly effect:
+fit <- arima(desaison, c(5,0,19))
+xm.source_vrai <- zoo(dt[[2]])
+desaison_vrai <- xm.source_vrai-lag(xm.source_vrai,-LAG) #
+
+dt_arima <- copy(dt)
+for (i in (1:dim(dt_arima)[1])) {
+  dt_arima[i,2] <- NaN
+  
+}
+for (i in (1:length(as.numeric(forecast(fit,h=7)$mean)))) {
+  dt_arima[518 +i,2] <- as.numeric(forecast(fit,h=7)$mean)[[i]]
+  
+}
+names(dt_arima)[names(dt_arima) == 'y'] <- 'y_arima'
+
+dt_lag <-copy(dt)
+for (i in (1:dim(dt_lag)[1])) {
+  dt_lag[i,2] <- desaison_vrai[i]
+  
+}
+```
+
+```{r}
+Graph <- cbind(dt_lag[dt_lag$date >= "2022-12-15" & dt_lag$date <= "2023-02-01", ][,-3], dt_arima[dt_arima$date >= "2022-12-15" & dt_arima$date <= "2023-02-01", ][,-3])
+dygraph(Graph, main = paste("Forecast VS Labels Black-Box model with LAG= ",toString(LAG)))%>%
+  dySeries("y", label = "Label") %>%
+  dySeries("y_arima", label = "Prev") 
+```
+
+### Prediction at horizon T+1 :
+
+```{r}
+#MSE sums with a forecast at t+1
+#Good predictions with lag
+LAG=30
+xm.source_test_all_lag <- zoo(dt[[2]])
+desaison_test_all_lag <- xm.source_test_all_lag-lag(xm.source_test_7_lag,-LAG) #
+desaison_test_all_lag <- desaison_test_all_lag[523:length(xm.source_test_all_lag)]
+desaison_test_all_lag
+summary(desaison_test_all_lag)
+plot(desaison_test_all_lag)
+```
+
+```{r}
+Liste_prev_lag <- c()
+LAG=30
+xm.source_all_lag <- zoo(dt[[2]])
+L <-length(xm.source_all_lag)
+desaison_all_lag <- xm.source_all_lag-lag(xm.source_all_lag,-LAG) #
+Zoo=zoo(desaison_all_lag)
+for (i in (523:L)) {
+  fit <- arima(Zoo[1:i], c(3,0,9))
+  Liste_prev_lag<-c(Liste_prev_lag,as.numeric(forecast(fit,h=1)$mean))
+}
+Liste_prev_lag
+```
+
+```{r}
+dt_arima <- copy(dt)
+for (i in (1:dim(dt_arima)[1])) {
+  dt_arima[i,2] <- NaN
+  
+}
+for (i in (523:L)) {
+  dt_arima[i,2] <- Liste_prev_lag[[i-522]]
+  
+}
+names(dt_arima)[names(dt_arima) == 'y'] <- 'y_arima'
+
+dt_lag <-copy(dt)
+for (i in (1:dim(dt_lag)[1])) {
+  dt_lag[i,2] <- desaison_vrai[i]
+  
+}
+
+```
+
+```{r}
+# Create lag variables
+lag_names <- paste0("y_lag_", 1:4)
+dt_prev <- copy(dt)
+
+LAG=30
+X <- zoo(dt_prev[[2]])
+X_lag <- X-lag(X,-LAG) #
+
+for (i in (1:length(dt_prev[[2]]))) {
+  dt_prev[i,2] <- X_lag[i]
+  
+}
+
+dt_prev[, c(lag_names) := shift(x = y, n = 1:4, type = "lag")]
+dt_prev <- na.omit(dt_prev)
+
+# We calculate the forecasts
+dt_prev[, prev := rowMeans(.SD), .SDcols = lag_names]
+
+# Forecast
+dt_init_prev <- dt_prev[year(date) <= 2022, prev := NA]
+
+LAG=30
+xm.source_all_lag <- zoo(dt_init_prev[[8]])
+desaison_all_lag <- xm.source_all_lag-lag(xm.source_all_lag,-LAG) #
+```
+
+```{r}
+Graph <- cbind(dt_lag[dt_lag$date >= "2022-12-15" & dt_lag$date <= "2023-02-01", ][,-3], dt_arima[dt_arima$date >= "2022-12-15" & dt_arima$date <= "2023-02-01", ][,-3],dt_init_prev[dt_init_prev$date >= "2022-12-15" & dt_init_prev$date <= "2023-02-01", ][,8])
+dygraph(Graph, main = paste("Forecast VS Labels Black-Box model with LAG= ",toString(LAG)))%>%
+  dySeries("y", label = "Label") %>%
+  dySeries("y_arima", label = "Prev") %>%
+  dySeries("prev", label = "Prev_EDF")
+
+```
+
+```{r}
+#ARMA(3,9) with t+1
+rmse_init <- get_rmse(y_true = desaison_test_all_lag[ !is.na(desaison_test_all_lag), desaison_test_all_lag],
+                      y_prev = dt_init_prev[ !is.na(prev), prev])
+rmse_init
+```
+
+```{r}
+#ARMA(3,9) with t+1
+rmse_init <- get_rmse(y_true = desaison_test_all_lag[ !is.na(desaison_test_all_lag), desaison_test_all_lag],
+                      y_prev = Liste_prev_lag)
+rmse_init
+```
+
+```{r}
+#True values
+desaison_test_all_lag[ !is.na(desaison_test_all_lag), desaison_test_all_lag]
+```
+
+```{r}
+#Our model
+Liste_prev_lag
+```
+
+```{r}
+#EDF
+dt_init_prev[ !is.na(prev), prev]
+```
+
