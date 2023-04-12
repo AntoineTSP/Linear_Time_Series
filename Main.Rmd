@@ -1,7 +1,7 @@
 ---
 title: '[ENSAE, 2A] Linear Time Series 2023'
 author: "Tristan Amadei/ Antoine Klein"
-date: "2023-03-17"
+date: "2023-04-12"
 output:
   html_document:
     toc: yes
@@ -101,8 +101,8 @@ manipulateWidget::combineWidgets(list = list(gy, gx), nrow = 2)
 
 *Questions :*
 
--   how to do a train/test split when the data are temporal?
--   how to do a cross-validation on time series?
+-   How to do a train/test split when the data are temporal?
+-   How to do a cross-validation on time series?
 
 *Selection of the train/test cut :*
 
@@ -153,86 +153,11 @@ rmse_init
 ```
 
 ```{r fig.width=8, fig.height=3, fig.align='center'}
-dygraphs::dygraph(data = dt_init_prev[, .(date, y, prev)], main = "prev vs true") %>% 
+dygraphs::dygraph(data = dt_init_prev[, .(date, y, prev)], main = "Prediction vs True") %>% 
   dygraphs::dySeries(name = "prev", color = "red")
 ```
 
--   Analyze the graph above.
-
 ## Improvements
-
-### Adding covariates
-
-Covariates can be :
-
--   delays of `y` ;
--   delays of `x` ;
--   aggregates of `y` and/or `x` delays.
-
-```{r}
-## Add lag of x and y
-dt_model <- copy(dt)
-dt_model[, c(paste0("y_lag_", 1:14)) := shift(x = y, n = 1:14, type = "lag")]
-dt_model[, c(paste0("x_lag_", 1:14)) := shift(x = x, n = 1:14, type = "lag")]
-dt_model <- na.omit(dt_model)
-```
-
-```{r}
-dt_train <- dt_model[year(date) <= 2022]
-dt_test <- dt_model[year(date) > 2022]
-```
-
-### PLS
-
-Partial least squares (PLS) regression. The number of components to be retained is determined by cross-validation on the training data. Reference: [cliquer ici](https://www.math.univ-toulouse.fr/~besse/Wikistat/pdf/st-m-app-sparse-pls.pdf) ;
-
--   PLS than on the delays of the production `y` ;
-
-```{r}
-ylag <- paste0("y_lag_", 1:14)
-
-## Model estimation
-pls_prod <- pls::plsr(formula = y ~ .,
-                      data = dt_train[, .SD, .SDcols = c("y", ylag)],
-                      validation = "CV")
-## Take optimal ncomp
-rmsepcv.pls <- pls::MSEP(pls_prod, estimate = 'CV')
-ncp.optim <- which.min(rmsepcv.pls$val["CV", , ]) - 1
-ncp.optim <- ifelse(ncp.optim == 0, 1, ncp.optim)
-
-# Forecasts
-prev_pls <- predict(object = pls_prod, newdata = dt_test, ncomp = ncp.optim)
-
-## Forecasts are bound if they are less than 0
-prev_pls <- ifelse(prev_pls[, 1, 1] < 0, 0, prev_pls[, 1, 1])
-prev_pls <- unname(prev_pls)
-```
-
-```{r}
-rmse_pls <- get_rmse(y_true = dt_test[, y], y_prev = prev_pls)
-rmse_pls
-```
-
-```{r fig.width=8, fig.height=3, fig.align='center'}
-dt_prev_pls <- rbind(
-  copy(dt_test)[, .(date, y)][, prev_pls := prev_pls],
-  copy(dt_train)[, .(date, y)][, prev_pls := NA]
-)
-
-dygraphs::dygraph(data = dt_prev_pls, main = "PLS - prev vs true") %>% 
-  dygraphs::dySeries(name = "prev_pls", color = "red")
-```
-
-*TO DO :*
-
--   Compare this rmse to the initial forecast ;
--   Add the covariates in `x_` to the model. Is there an improvement? Why or why not?
--   Create more lag aggregates and add them to the model. Is there an improvement?
-
-### LS
-
--   Implement a linear regression. Compare it to your best PLS model?
--   Reference : [cliquez ici.](https://bookdown.org/evraloui/lbira2110/modeles-lineaires.html)
 
 ### ARIMA
 
@@ -595,7 +520,7 @@ for (i in (1:dim(dt_lag)[1])) {
 
 ```{r}
 Graph <- cbind(dt_lag[dt_lag$date >= "2022-12-15" & dt_lag$date <= "2023-02-01", ][,-3], dt_arima[dt_arima$date >= "2022-12-15" & dt_arima$date <= "2023-02-01", ][,-3])
-dygraph(Graph, main = paste("Forecast VS Labels Black-Box model with LAG= ",toString(LAG)))%>%
+dygraph(Graph, main = paste("Forecast VS Labels with LAG= ",toString(LAG)))%>%
   dySeries("y", label = "Label") %>%
   dySeries("y_arima", label = "Prev") 
 ```
@@ -678,7 +603,7 @@ desaison_all_lag <- xm.source_all_lag-lag(xm.source_all_lag,-LAG) #
 
 ```{r}
 Graph <- cbind(dt_lag[dt_lag$date >= "2022-12-15" & dt_lag$date <= "2023-02-01", ][,-3], dt_arima[dt_arima$date >= "2022-12-15" & dt_arima$date <= "2023-02-01", ][,-3],dt_init_prev[dt_init_prev$date >= "2022-12-15" & dt_init_prev$date <= "2023-02-01", ][,8])
-dygraph(Graph, main = paste("Forecast VS Labels Black-Box model with LAG= ",toString(LAG)))%>%
+dygraph(Graph, main = paste("Forecast at T+1 VS Labels with LAG= ",toString(LAG)))%>%
   dySeries("y", label = "Label") %>%
   dySeries("y_arima", label = "Prev") %>%
   dySeries("prev", label = "Prev_EDF")
@@ -714,3 +639,100 @@ Liste_prev_lag
 dt_init_prev[ !is.na(prev), prev]
 ```
 
+
+### Machine Learning Model
+
+# Implementation of a Random Forest to do a regression
+
+
+```{r}
+#We install the package accordingly
+install.packages("randomForest")
+library(randomForest)
+```
+```{r}
+#We fit the model
+rf = randomForest(y ~ date + x, data = dt_train)
+rf
+```
+
+```{r}
+#We compute the MSE score on our sample of TRAIN
+rmse_init <- get_rmse(y_true = dt_train$y,
+                      y_prev = predict(rf, newdata = dt_train))
+rmse_init
+```
+```{r}
+#We compute the MSE score on our sample of TEST
+rmse_init <- get_rmse(y_true = dt_test$y,
+                      y_prev = predict(rf, newdata = dt_test))
+rmse_init
+#We overfit !
+```
+```{r}
+#We make a list of our predictions
+Liste_prev_ML <- c()
+xm.source_ML <- zoo(dt[[2]])
+L <-length(xm.source_ML)
+Zoo=zoo(xm.source_ML)
+for (i in (522:L)) {
+  rf <- randomForest(y ~ date + x, data = dt[-(i:length(dt[[1]])),])
+  Liste_prev_ML<-c(Liste_prev_ML, tail(predict(rf, newdata = dt[-(i+1:length(dt_lag[[1]])),]), n=1))
+}
+Liste_prev_ML
+```
+
+
+```{r}
+#We prepare the dataframe for the plot
+dt_ML <- copy(dt)
+for (i in (1:dim(dt_ML)[1])) {
+  dt_ML[i,2] <- NaN
+  
+}
+for (i in (522:L)) {
+  dt_ML[i,2] <- Liste_prev_ML[[i-521]]
+  
+}
+names(dt_ML)[names(dt_ML) == 'y'] <- 'y_ML'
+```
+
+```{r}
+#We plot
+Graph <- cbind(dt[dt$date >= "2022-12-15", ][,-3], dt_ML[dt_ML$date >= "2022-12-15", ][,-3])
+dygraph(Graph, main = paste("Forecast VS Labels model ML"))%>%
+  dySeries("y", label = "Label") %>%
+  dySeries("y_ML", label = "ML") 
+#It is not as good as the ARIMA model: it is normal, we do not take into account the temporal aspect of our data!
+
+```
+```{r}
+#MSE on 2023
+rmse_init <- get_rmse(y_true = dt[year(date) > 2022]$y,
+                      y_prev = dt_ML[year(date) > 2022]$y)
+rmse_init
+```
+
+```{r}
+#We try again by lagging our data set
+dt_lag <- dt_lag[-(532:length(dt_lag[[1]])),]
+```
+
+
+```{r}
+rf = randomForest(y ~ date + x, data = dt_lag[year(date) <= 2022])
+```
+
+```{r}
+rmse_init <- get_rmse(y_true = dt_lag[year(date) <= 2022]$y,
+                      y_prev = predict(rf, newdata = dt_lag[year(date) <= 2022]))
+rmse_init
+#It's not so good on the SET TRAIN
+```
+
+```{r}
+rmse_init <- get_rmse(y_true = dt_lag[year(date) > 2022]$y,
+                      y_prev = predict(rf, newdata = dt_lag[year(date) > 2022]))
+rmse_init
+#It's not so good on the TEST SET
+```
